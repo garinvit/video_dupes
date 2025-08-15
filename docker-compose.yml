@@ -1,0 +1,45 @@
+version: "3.9"
+
+services:
+  db:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB}
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+    volumes:
+      - db-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD", "pg_isready", "-U", "${POSTGRES_USER}"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  backend:
+    build: ./backend
+    environment:
+      DATABASE_URL: postgresql+psycopg://$POSTGRES_USER:$POSTGRES_PASSWORD@db:5432/$POSTGRES_DB
+      # В контейнер смонтируем хостовые папки с видео в /videos
+      VIDEO_ROOTS: ${VIDEO_ROOTS}
+      # Настройки по умолчанию
+      DEFAULT_FRAMES: 20
+      DEFAULT_SCALE: 320
+      DEFAULT_THRESHOLD: 0.88
+    depends_on:
+      db:
+        condition: service_healthy
+    volumes:
+      - ${HOST_VIDEO_DIR1:-.}:/videos/dir1:ro
+      - ${HOST_VIDEO_DIR2:-.}:/videos/dir2:ro
+    expose:
+      - "8000"
+
+  frontend:
+    build: ./frontend
+    depends_on:
+      - backend
+    ports:
+      - "8080:80"
+
+volumes:
+  db-data:
