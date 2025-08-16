@@ -1,0 +1,2060 @@
+# Repository layout
+```
+video-dupes/
+├─ docker-compose.yml
+├─ .env.example
+├─ README.md
+├─ backend/
+│  ├─ Dockerfile
+│  ├─ requirements.txt
+│  └─ app/
+│     ├─ __init__.py
+│     ├─ main.py
+│     ├─ db.py
+│     ├─ models.py
+│     ├─ schemas.py
+│     ├─ duplicate_finder.py
+│     └─ routers/
+│        ├─ jobs.py
+│        ├─ pairs.py
+│        └─ files.py
+├─ frontend/
+│  ├─ Dockerfile
+│  ├─ nginx.conf
+│  ├─ index.html
+│  ├─ package.json
+│  ├─ vite.config.ts
+│  └─ src/
+│     ├─ main.tsx
+│     ├─ App.tsx
+│     ├─ api.ts
+│     ├─ components/
+│     │  ├─ JobForm.tsx
+│     │  ├─ PairsTable.tsx
+│     │  └─ SizeBar.tsx
+│     └─ types.ts
+```
+
+---
+
+## docker-compose.yml
+```yaml
+version: "3.9"
+
+services:
+  db:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB}
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+    volumes:
+      - db-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD", "pg_isready", "-U", "${POSTGRES_USER}"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  backend:
+    build: ./backend
+    environment:
+      DATABASE_URL: postgresql+psycopg://$POSTGRES_USER:$POSTGRES_PASSWORD@db:5432/$POSTGRES_DB
+      # В контейнер смонтируем хостовые папки с видео в /videos
+      VIDEO_ROOTS: ${VIDEO_ROOTS}
+      # Настройки по умолчанию
+      DEFAULT_FRAMES: 20
+      DEFAULT_SCALE: 320
+      DEFAULT_THRESHOLD: 0.88
+    depends_on:
+      db:
+        condition: service_healthy
+    volumes:
+      - ${HOST_VIDEO_DIR1:-.}:/videos/dir1:ro
+      - ${HOST_VIDEO_DIR2:-.}:/videos/dir2:ro
+    expose:
+      - "8000"
+
+  frontend:
+    build: ./frontend
+    depends_on:
+      - backend
+    ports:
+      - "8080:80"
+
+volumes:
+  db-data:
+```
+
+---
+
+## .env.example
+```env
+POSTGRES_DB=dupes
+POSTGRES_USER=dupes
+POSTGRES_PASSWORD=dupes
+# Список корневых путей внутри контейнера (через запятую). Эти пути должны быть примонтированы в backend.
+VIDEO_ROOTS=/videos/dir1,/videos/dir2
+# Укажи абсолютные пути на хосте к своим папкам с видео (для примера оставлены .)
+HOST_VIDEO_DIR1=/absolute/path/to/videosA
+HOST_VIDEO_DIR2=/absolute/path/to/videosB
+```
+
+---
+
+## backend/Dockerfile
+```Dockerfile
+FROM python:3.12-slim
+
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    ffmpeg \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /app
+COPY requirements.txt /app/
+RUN pip install --no-cache-dir -r requirements.txt
+
+# Alembic
+COPY alembic.ini /app/alembic.ini
+COPY alembic /app/alembic
+
+COPY app /app/app
+COPY entrypoint.sh /entrypoint.sh
+RUN chmod +x /entrypoint.sh
+
+EXPOSE 8000
+CMD ["/entrypoint.sh"]
+```Dockerfile
+FROM python:3.12-slim
+
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    ffmpeg \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /app
+COPY requirements.txt /app/
+RUN pip install --no-cache-dir -r requirements.txt
+
+COPY app /app/app
+
+EXPOSE 8000
+CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000"]
+```
+
+---
+
+## backend/requirements.txt
+```txt
+fastapi==0.114.0
+uvicorn[standard]==0.30.5
+pydantic==2.8.2
+SQLAlchemy==2.0.32
+psycopg[binary]==3.2.1
+alembic==1.13.2
+Pillow==10.4.0
+ImageHash==4.3.1
+python-multipart==0.0.9
+```txt
+fastapi==0.114.0
+uvicorn[standard]==0.30.5
+pydantic==2.8.2
+SQLAlchemy==2.0.32
+psycopg[binary]==3.2.1
+alembic==1.13.2
+Pillow==10.4.0
+ImageHash==4.3.1
+python-multipart==0.0.9
+```
+
+---
+
+## backend/app/db.py
+```python
+from sqlalchemy import create_engine
+from sqlalchemy.orm import sessionmaker, declarative_base
+import os
+
+DATABASE_URL = os.getenv("DATABASE_URL")
+
+engine = create_engine(DATABASE_URL, pool_pre_ping=True)
+SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
+Base = declarative_base()
+```
+
+---
+
+## backend/app/models.py
+```python
+from sqlalchemy import Column, Integer, String, Float, BigInteger, ForeignKey, Text, DateTime, Boolean
+from sqlalchemy.orm import relationship
+from datetime import datetime
+from .db import Base
+
+class Job(Base):
+    __tablename__ = "jobs"
+    id = Column(Integer, primary_key=True)
+    status = Column(String(32), default="queued")  # queued, running, done, error
+    params = Column(Text, nullable=False)
+    created_at = Column(DateTime, default=datetime.utcnow)
+    started_at = Column(DateTime, nullable=True)
+    finished_at = Column(DateTime, nullable=True)
+    error = Column(Text, nullable=True)
+
+    pairs = relationship("Pair", back_populates="job", cascade="all, delete-orphan")
+    groups = relationship("Group", back_populates="job", cascade="all, delete-orphan")
+
+class Pair(Base):
+    __tablename__ = "pairs"
+    id = Column(Integer, primary_key=True)
+    job_id = Column(Integer, ForeignKey("jobs.id", ondelete="CASCADE"), index=True)
+    similarity = Column(Float, index=True)
+    label = Column(String(32))
+
+    file_a = Column(Text, nullable=False)
+    size_a = Column(BigInteger)
+    duration_a = Column(Float)
+    res_a = Column(String(32))
+
+    file_b = Column(Text, nullable=False)
+    size_b = Column(BigInteger)
+    duration_b = Column(Float)
+    res_b = Column(String(32))
+
+    job = relationship("Job", back_populates="pairs")
+
+class Group(Base):
+    __tablename__ = "groups"
+    id = Column(Integer, primary_key=True)
+    job_id = Column(Integer, ForeignKey("jobs.id", ondelete="CASCADE"), index=True)
+    representative_path = Column(Text, nullable=False)
+    count = Column(Integer, default=0)
+    total_size = Column(BigInteger, default=0)  # сумма размеров файлов в группе
+
+    job = relationship("Job", back_populates="groups")
+    files = relationship("GroupFile", back_populates="group", cascade="all, delete-orphan")
+
+class GroupFile(Base):
+    __tablename__ = "group_files"
+    id = Column(Integer, primary_key=True)
+    group_id = Column(Integer, ForeignKey("groups.id", ondelete="CASCADE"), index=True)
+    path = Column(Text, nullable=False)
+    size = Column(BigInteger)
+    duration = Column(Float)
+    res = Column(String(32))
+    is_representative = Column(Boolean, default=False)
+
+    group = relationship("Group", back_populates="files")
+```python
+from sqlalchemy import Column, Integer, String, Float, BigInteger, ForeignKey, Text, DateTime
+from sqlalchemy.orm import relationship
+from datetime import datetime
+from .db import Base
+
+class Job(Base):
+    __tablename__ = "jobs"
+    id = Column(Integer, primary_key=True)
+    status = Column(String(32), default="queued")  # queued, running, done, error
+    params = Column(Text, nullable=False)
+    created_at = Column(DateTime, default=datetime.utcnow)
+    started_at = Column(DateTime, nullable=True)
+    finished_at = Column(DateTime, nullable=True)
+    error = Column(Text, nullable=True)
+
+    pairs = relationship("Pair", back_populates="job", cascade="all, delete-orphan")
+
+class Pair(Base):
+    __tablename__ = "pairs"
+    id = Column(Integer, primary_key=True)
+    job_id = Column(Integer, ForeignKey("jobs.id", ondelete="CASCADE"), index=True)
+    similarity = Column(Float, index=True)
+    label = Column(String(32))
+
+    file_a = Column(Text, nullable=False)
+    size_a = Column(BigInteger)
+    duration_a = Column(Float)
+    res_a = Column(String(32))
+
+    file_b = Column(Text, nullable=False)
+    size_b = Column(BigInteger)
+    duration_b = Column(Float)
+    res_b = Column(String(32))
+
+    job = relationship("Job", back_populates="pairs")
+```
+
+---
+
+## backend/app/schemas.py
+```python
+from pydantic import BaseModel, Field
+from typing import List, Optional
+from datetime import datetime
+
+class StartJobRequest(BaseModel):
+    roots: List[str]  # пути внутри контейнера (например /videos/dir1)
+    frames: int = Field(20, ge=4, le=80)
+    scale: int = Field(320, ge=0, le=1920)
+    threshold: float = Field(0.88, ge=0.5, le=1.0)
+    exts: List[str] = Field(default_factory=lambda: [".mp4",".mkv",".avi",".mov",".m4v",".webm",".ts",".mts",".m2ts",".wmv",".flv"])
+
+class JobOut(BaseModel):
+    id: int
+    status: str
+    created_at: datetime
+    started_at: Optional[datetime] = None
+    finished_at: Optional[datetime] = None
+    error: Optional[str] = None
+
+    class Config:
+        from_attributes = True
+
+class PairOut(BaseModel):
+    id: int
+    similarity: float
+    label: str
+    file_a: str
+    size_a: int
+    duration_a: float
+    res_a: str
+    file_b: str
+    size_b: int
+    duration_b: float
+    res_b: str
+
+    class Config:
+        from_attributes = True
+
+class DeleteRequest(BaseModel):
+    paths: List[str]
+
+class SizeResponse(BaseModel):
+    bytes: int
+
+# --- Groups ---
+class GroupFileOut(BaseModel):
+    id: int
+    path: str
+    size: int
+    duration: float
+    res: str
+    is_representative: bool
+
+    class Config:
+        from_attributes = True
+
+class GroupOut(BaseModel):
+    id: int
+    job_id: int
+    representative_path: str
+    count: int
+    total_size: int
+    files: List[GroupFileOut]
+
+    class Config:
+        from_attributes = True
+
+class GroupDeleteRequest(BaseModel):
+    # Если пусто — удаляем все КРОМЕ эталона
+    paths: Optional[List[str]] = None
+```python
+from pydantic import BaseModel, Field
+from typing import List, Optional
+from datetime import datetime
+
+class StartJobRequest(BaseModel):
+    roots: List[str]  # пути внутри контейнера (например /videos/dir1)
+    frames: int = Field(20, ge=4, le=80)
+    scale: int = Field(320, ge=0, le=1920)
+    threshold: float = Field(0.88, ge=0.5, le=1.0)
+    exts: List[str] = Field(default_factory=lambda: [".mp4",".mkv",".avi",".mov",".m4v",".webm",".ts",".mts",".m2ts",".wmv",".flv"])
+
+class JobOut(BaseModel):
+    id: int
+    status: str
+    created_at: datetime
+    started_at: Optional[datetime] = None
+    finished_at: Optional[datetime] = None
+    error: Optional[str] = None
+
+    class Config:
+        from_attributes = True
+
+class PairOut(BaseModel):
+    id: int
+    similarity: float
+    label: str
+    file_a: str
+    size_a: int
+    duration_a: float
+    res_a: str
+    file_b: str
+    size_b: int
+    duration_b: float
+    res_b: str
+
+    class Config:
+        from_attributes = True
+
+class DeleteRequest(BaseModel):
+    paths: List[str]
+
+class SizeResponse(BaseModel):
+    bytes: int
+```
+
+---
+
+## backend/app/duplicate_finder.py
+```python
+import os
+import io
+import json
+from pathlib import Path
+from typing import List, Tuple, Optional, Dict
+import subprocess
+
+from PIL import Image
+import imagehash
+
+VIDEO_EXTS = {".mp4", ".mkv", ".avi", ".mov", ".m4v", ".webm", ".ts", ".mts", ".m2ts", ".wmv", ".flv"}
+
+# ---- ffprobe
+
+def ffprobe(path: Path):
+    cmd = [
+        "ffprobe","-v","error",
+        "-select_streams","v:0",
+        "-show_entries","format=duration",
+        "-show_entries","stream=width,height",
+        "-of","json",
+        str(path)
+    ]
+    try:
+        out = subprocess.check_output(cmd, stderr=subprocess.STDOUT)
+        data = json.loads(out.decode("utf-8", errors="ignore"))
+        duration = float(data.get("format",{}).get("duration", 0) or 0)
+        width = height = None
+        for st in data.get("streams", []):
+            if st.get("width") and st.get("height"):
+                width = int(st["width"]) ; height = int(st["height"]) ; break
+        return duration, width, height
+    except subprocess.CalledProcessError:
+        return 0.0, None, None
+
+# ---- hashing frames
+
+def phash_image_bytes(jpeg_bytes: bytes) -> int:
+    img = Image.open(io.BytesIO(jpeg_bytes))
+    return int(str(imagehash.phash(img)), 16)
+
+
+def grab_frame_phash(path: Path, timestamp: float, scale_width: Optional[int]) -> Optional[int]:
+    vf = f"scale={scale_width}:-2" if scale_width and scale_width > 0 else "null"
+    cmd = [
+        "ffmpeg","-ss",f"{timestamp:.3f}","-i",str(path),
+        "-frames:v","1","-vf",vf,"-f","image2pipe","-vcodec","mjpeg","-loglevel","error","pipe:1"
+    ]
+    try:
+        out = subprocess.check_output(cmd, stderr=subprocess.STDOUT)
+        return phash_image_bytes(out)
+    except subprocess.CalledProcessError:
+        return None
+
+
+def linspace(start: float, stop: float, num: int, endpoint: bool=False) -> List[float]:
+    if num <= 0: return []
+    if num == 1: return [start]
+    step = (stop - start) / (num -  (1 if endpoint else 0) )
+    return [start + i*step for i in range(num - (0 if endpoint else 1))]
+
+
+def hamming64(a:int,b:int)->int:
+    return (a ^ b).bit_count()
+
+
+def seq_similarity(sig_a: List[int], sig_b: List[int]) -> float:
+    if not sig_a or not sig_b: return 0.0
+    if len(sig_a) > len(sig_b):
+        sig_a, sig_b = sig_b, sig_a
+    la, lb = len(sig_a), len(sig_b)
+    best = 0.0
+    denom = 64.0 * la
+    for offset in range(0, lb - la + 1):
+        dist_sum = 0
+        for i in range(la):
+            dist_sum += hamming64(sig_a[i], sig_b[offset+i])
+        sim = 1.0 - (dist_sum/denom)
+        if sim > best: best = sim
+        if best > 0.999: break
+    return best
+
+
+def gather_videos(roots: List[Path], exts: List[str]) -> List[Path]:
+    exts_set = {e.lower() if e.startswith('.') else '.'+e.lower() for e in exts}
+    vids = []
+    for r in roots:
+        r = r.expanduser()
+        if r.is_file():
+            if r.suffix.lower() in exts_set: vids.append(r)
+        elif r.is_dir():
+            for root, _, files in os.walk(r):
+                for name in files:
+                    if Path(name).suffix.lower() in exts_set:
+                        vids.append(Path(root)/name)
+    return vids
+
+
+def signature_for(path: Path, frames: int, scale: int):
+    duration, width, height = ffprobe(path)
+    horizon = duration if duration > 0.1 else 600.0
+    times = linspace(0.0, horizon, frames, endpoint=False)
+    hashes = []
+    for t in times:
+        h = grab_frame_phash(path, t, scale)
+        if h is not None: hashes.append(h)
+    st = path.stat()
+    res = f"{width}x{height}" if width and height else ""
+    return {
+        "path": str(path),
+        "size": st.st_size,
+        "duration": float(duration or 0.0),
+        "res": res,
+        "hashes": hashes,
+    }
+
+
+def compare_all(signs: List[dict], threshold: float):
+    pairs = []
+    def central(hs):
+        return hs[len(hs)//2] if hs else None
+    for i in range(len(signs)):
+        for j in range(i+1, len(signs)):
+            a, b = signs[i], signs[j]
+            if not a["hashes"] or not b["hashes"]: continue
+            ca, cb = central(a["hashes"]), central(b["hashes"])
+            if ca is not None and cb is not None and hamming64(ca,cb) > 20:
+                continue
+            sim = seq_similarity(a["hashes"], b["hashes"])
+            if sim >= threshold:
+                da, db = a["duration"], b["duration"]
+                full_like = (min(da,db)>0 and (min(da,db)/max(da,db))>0.95 and sim>0.98)
+                label = "full-duplicate" if full_like else "near/partial-duplicate"
+                pairs.append({
+                    "similarity": float(sim),
+                    "label": label,
+                    "a": a,
+                    "b": b,
+                })
+    pairs.sort(key=lambda x: x["similarity"], reverse=True)
+    return pairs
+
+# --- Кластеризация дублей в группы ---
+
+def build_groups(signs: List[dict], pairs: List[dict], choose_best=True):
+    """
+    На вход: сигнатуры и список пар (как из compare_all).
+    Возвращает список групп: { 'files': [filedict,...], 'representative': path, 'total_size': int }
+    """
+    # Индексация по пути
+    idx_by_path: Dict[str, int] = {s['path']: i for i, s in enumerate(signs)}
+    parent = list(range(len(signs)))
+
+    def find(x):
+        while parent[x] != x:
+            parent[x] = parent[parent[x]]
+            x = parent[x]
+        return x
+    def union(a,b):
+        ra, rb = find(a), find(b)
+        if ra != rb:
+            parent[rb] = ra
+
+    for p in pairs:
+        a = idx_by_path.get(p['a']['path'])
+        b = idx_by_path.get(p['b']['path'])
+        if a is not None and b is not None:
+            union(a,b)
+
+    comps: Dict[int, List[int]] = {}
+    for i in range(len(signs)):
+        r = find(i)
+        comps.setdefault(r, []).append(i)
+
+    groups = []
+    for comp in comps.values():
+        if len(comp) < 2:
+            continue  # одиночки не интересны
+        files = [signs[i] for i in comp]
+        # выбрать эталон: максимальная длительность, далее разрешение (площадь), далее размер
+        def parse_res(r: str):
+            try:
+                w,h = r.lower().split('x')
+                return int(w)*int(h)
+            except Exception:
+                return 0
+        best = max(files, key=lambda f: (f.get('duration',0.0), parse_res(f.get('res','')), f.get('size',0)))
+        total = sum(int(f.get('size',0)) for f in files)
+        groups.append({
+            'files': files,
+            'representative': best['path'],
+            'total_size': total,
+        })
+    return groups
+```
+
+---
+
+## backend/app/routers/jobs.py
+```python
+from fastapi import APIRouter, Depends, BackgroundTasks, HTTPException
+from sqlalchemy.orm import Session
+from sqlalchemy import delete
+from datetime import datetime
+import os
+from pathlib import Path
+
+from ..db import SessionLocal
+from ..models import Job, Pair, Group, GroupFile
+from ..schemas import StartJobRequest, JobOut
+from ..duplicate_finder import gather_videos, signature_for, compare_all, build_groups
+
+router = APIRouter(prefix="/api/jobs", tags=["jobs"])
+
+
+def get_db():
+    db = SessionLocal()
+    try:
+        yield db
+    finally:
+        db.close()
+
+
+def run_job(job_id: int, params: StartJobRequest):
+    db = SessionLocal()
+    try:
+        job = db.get(Job, job_id)
+        if not job:
+            return
+        job.status = "running"
+        job.started_at = datetime.utcnow()
+        db.commit()
+        db.refresh(job)
+
+        roots = [Path(r) for r in params.roots]
+        exts = params.exts
+
+        allowed_roots = [Path(p) for p in os.getenv("VIDEO_ROOTS", "").split(",") if p]
+
+        def is_allowed(p: Path):
+            try:
+                rp = p.resolve()
+                return any(str(rp).startswith(str(ar.resolve())) for ar in allowed_roots)
+            except Exception:
+                return False
+
+        for r in roots:
+            if not is_allowed(r):
+                raise RuntimeError(f"Path not allowed: {r}")
+
+        videos = gather_videos(roots, exts)
+        signs = [signature_for(v, params.frames, params.scale) for v in videos]
+        pairs = compare_all(signs, params.threshold)
+
+        # очистим прошлые результаты
+        db.execute(delete(Pair).where(Pair.job_id == job.id))
+        db.execute(delete(GroupFile).where(GroupFile.group_id.in_(
+            db.query(Group.id).filter(Group.job_id==job.id)
+        )))
+        db.execute(delete(Group).where(Group.job_id == job.id))
+
+        # сохраним пары
+        for p in pairs:
+            a, b = p["a"], p["b"]
+            db.add(Pair(
+                job_id=job.id,
+                similarity=p["similarity"],
+                label=p["label"],
+                file_a=a["path"], size_a=a["size"], duration_a=a["duration"], res_a=a["res"],
+                file_b=b["path"], size_b=b["size"], duration_b=b["duration"], res_b=b["res"],
+            ))
+        db.commit()
+
+        # построим группы
+        groups = build_groups(signs, pairs)
+        for g in groups:
+            grp = Group(job_id=job.id, representative_path=g['representative'], count=len(g['files']), total_size=g['total_size'])
+            db.add(grp)
+            db.flush()
+            for f in g['files']:
+                db.add(GroupFile(
+                    group_id=grp.id,
+                    path=f['path'],
+                    size=f.get('size'),
+                    duration=f.get('duration'),
+                    res=f.get('res',''),
+                    is_representative=(f['path']==g['representative'])
+                ))
+        job.status = "done"
+        job.finished_at = datetime.utcnow()
+        db.commit()
+    except Exception as e:
+        job = db.get(Job, job_id)
+        if job:
+            job.status = "error"
+            job.error = str(e)
+            job.finished_at = datetime.utcnow()
+            db.commit()
+    finally:
+        db.close()
+
+
+@router.post("/", response_model=JobOut)
+def start_job(body: StartJobRequest, bg: BackgroundTasks, db: Session = Depends(get_db)):
+    roots = body.roots or [p for p in os.getenv("VIDEO_ROOTS", "").split(",") if p]
+    if not roots:
+        raise HTTPException(400, detail="Roots are empty. Set VIDEO_ROOTS or pass roots.")
+    body.roots = roots
+
+    job = Job(status="queued", params=body.model_dump_json())
+    db.add(job)
+    db.commit()
+    db.refresh(job)
+
+    bg.add_task(run_job, job.id, body)
+    return job
+
+
+@router.get("/{job_id}", response_model=JobOut)
+def get_job(job_id: int, db: Session = Depends(get_db)):
+    job = db.get(Job, job_id)
+    if not job:
+        raise HTTPException(404, detail="Job not found")
+    return job
+```python
+from fastapi import APIRouter, Depends, BackgroundTasks, HTTPException
+from sqlalchemy.orm import Session
+from sqlalchemy import select, delete
+from datetime import datetime
+import json
+import os
+from typing import List
+
+from ..db import SessionLocal, engine
+from ..models import Job, Pair, Base
+from ..schemas import StartJobRequest, JobOut
+from ..duplicate_finder import gather_videos, signature_for, compare_all
+
+router = APIRouter(prefix="/api/jobs", tags=["jobs"])
+
+# создаём таблицы без alembic для простоты демо
+Base.metadata.create_all(bind=engine)
+
+
+def get_db():
+    db = SessionLocal()
+    try:
+        yield db
+    finally:
+        db.close()
+
+
+def run_job(job_id: int, params: StartJobRequest):
+    db = SessionLocal()
+    try:
+        job = db.get(Job, job_id)
+        if not job: return
+        job.status = "running"
+        job.started_at = datetime.utcnow()
+        db.commit()
+        db.refresh(job)
+
+        roots = [Path(r) for r in params.roots]
+        exts = params.exts
+
+        # проверка, что пути лежат внутри доступных смонитрованных корней (базовая безопасность)
+        allowed_roots = [Path(p) for p in os.getenv("VIDEO_ROOTS", "").split(",") if p]
+
+        def is_allowed(p: Path):
+            try:
+                rp = p.resolve()
+                return any(str(rp).startswith(str(ar.resolve())) for ar in allowed_roots)
+            except Exception:
+                return False
+
+        for r in roots:
+            if not is_allowed(r):
+                raise RuntimeError(f"Path not allowed: {r}")
+
+        videos = gather_videos(roots, exts)
+        signs = [signature_for(v, params.frames, params.scale) for v in videos]
+        pairs = compare_all(signs, params.threshold)
+
+        # сохранить в БД
+        db.execute(delete(Pair).where(Pair.job_id==job.id))
+        for p in pairs:
+            a, b = p["a"], p["b"]
+            db.add(Pair(
+                job_id=job.id,
+                similarity=p["similarity"],
+                label=p["label"],
+                file_a=a["path"], size_a=a["size"], duration_a=a["duration"], res_a=a["res"],
+                file_b=b["path"], size_b=b["size"], duration_b=b["duration"], res_b=b["res"],
+            ))
+        job.status = "done"
+        job.finished_at = datetime.utcnow()
+        db.commit()
+    except Exception as e:
+        job = db.get(Job, job_id)
+        if job:
+            job.status = "error"
+            job.error = str(e)
+            job.finished_at = datetime.utcnow()
+            db.commit()
+    finally:
+        db.close()
+
+
+@router.post("/", response_model=JobOut)
+def start_job(body: StartJobRequest, bg: BackgroundTasks, db: Session = Depends(get_db)):
+    # Если корни не указаны — взять из переменной окружения
+    roots = body.roots or [p for p in os.getenv("VIDEO_ROOTS","" ).split(",") if p]
+    if not roots:
+        raise HTTPException(400, detail="Roots are empty. Set VIDEO_ROOTS or pass roots.")
+    body.roots = roots
+
+    job = Job(status="queued", params=body.model_dump_json())
+    db.add(job)
+    db.commit()
+    db.refresh(job)
+
+    bg.add_task(run_job, job.id, body)
+    return job
+
+
+@router.get("/{job_id}", response_model=JobOut)
+def get_job(job_id: int, db: Session = Depends(get_db)):
+    job = db.get(Job, job_id)
+    if not job:
+        raise HTTPException(404, detail="Job not found")
+    return job
+```
+
+---
+
+## backend/app/routers/pairs.py
+```python
+from fastapi import APIRouter, Depends
+from sqlalchemy.orm import Session
+from sqlalchemy import select
+from typing import List
+
+from ..db import SessionLocal
+from ..models import Pair
+from ..schemas import PairOut
+
+router = APIRouter(prefix="/api/pairs", tags=["pairs"])
+
+def get_db():
+    db = SessionLocal()
+    try:
+        yield db
+    finally:
+        db.close()
+
+@router.get("/{job_id}", response_model=List[PairOut])
+def list_pairs(job_id: int, db: Session = Depends(get_db)):
+    rows = db.execute(select(Pair).where(Pair.job_id==job_id).order_by(Pair.similarity.desc())).scalars().all()
+    return rows
+```
+
+---
+
+## backend/app/routers/groups.py
+```python
+from fastapi import APIRouter, Depends, HTTPException
+from sqlalchemy.orm import Session
+from sqlalchemy import select
+from typing import List
+from pathlib import Path
+import os
+
+from ..db import SessionLocal
+from ..models import Group, GroupFile
+from ..schemas import GroupOut, GroupDeleteRequest, SizeResponse
+
+router = APIRouter(prefix="/api/groups", tags=["groups"])
+
+def get_db():
+    db = SessionLocal()
+    try:
+        yield db
+    finally:
+        db.close()
+
+@router.get("/{job_id}", response_model=List[GroupOut])
+def list_groups(job_id: int, db: Session = Depends(get_db)):
+    groups = db.execute(select(Group).where(Group.job_id==job_id)).scalars().all()
+    # eager load files
+    for g in groups:
+        g.files  # access relationship
+    return groups
+
+@router.post("/{group_id}/size", response_model=SizeResponse)
+def group_size(group_id: int, body: GroupDeleteRequest, db: Session = Depends(get_db)):
+    g = db.get(Group, group_id)
+    if not g:
+        raise HTTPException(404, detail="Group not found")
+    if body.paths:
+        paths = body.paths
+    else:
+        paths = [f.path for f in g.files if not f.is_representative]
+    total = 0
+    for p in paths:
+        try:
+            total += Path(p).stat().st_size
+        except Exception:
+            pass
+    return SizeResponse(bytes=total)
+
+@router.post("/{group_id}/delete", response_model=SizeResponse)
+def group_delete(group_id: int, body: GroupDeleteRequest, db: Session = Depends(get_db)):
+    g = db.get(Group, group_id)
+    if not g:
+        raise HTTPException(404, detail="Group not found")
+    if body.paths:
+        paths = body.paths
+    else:
+        paths = [f.path for f in g.files if not f.is_representative]
+    total = 0
+    for p in paths:
+        try:
+            rp = Path(p).resolve()
+            sz = rp.stat().st_size
+            os.remove(rp)
+            total += sz
+        except Exception:
+            pass
+    return SizeResponse(bytes=total)
+```
+
+
+## backend/app/routers/files.py
+```python
+from fastapi import APIRouter
+from ..schemas import DeleteRequest, SizeResponse
+from pathlib import Path
+from typing import Set
+import os
+
+router = APIRouter(prefix="/api/files", tags=["files"])
+
+@router.post("/size", response_model=SizeResponse)
+def get_size(body: DeleteRequest):
+    total = 0
+    seen: Set[str] = set()
+    for p in body.paths:
+        try:
+            rp = str(Path(p).resolve())
+            if rp in seen: continue
+            total += Path(rp).stat().st_size
+            seen.add(rp)
+        except Exception:
+            pass
+    return SizeResponse(bytes=total)
+
+@router.post("/delete", response_model=SizeResponse)
+def delete_files(body: DeleteRequest):
+    total = 0
+    for p in body.paths:
+        try:
+            rp = Path(p).resolve()
+            sz = rp.stat().st_size
+            os.remove(rp)
+            total += sz
+        except Exception:
+            pass
+    return SizeResponse(bytes=total)
+```python
+from fastapi import APIRouter
+from ..schemas import DeleteRequest, SizeResponse
+from pathlib import Path
+from typing import Set
+import os
+
+router = APIRouter(prefix="/api/files", tags=["files"])
+
+@router.post("/size", response_model=SizeResponse)
+def get_size(body: DeleteRequest):
+    total = 0
+    seen: Set[str] = set()
+    for p in body.paths:
+        try:
+            rp = str(Path(p).resolve())
+            if rp in seen: continue
+            total += Path(rp).stat().st_size
+            seen.add(rp)
+        except Exception:
+            pass
+    return SizeResponse(bytes=total)
+
+@router.post("/delete", response_model=SizeResponse)
+def delete_files(body: DeleteRequest):
+    total = 0
+    for p in body.paths:
+        try:
+            rp = Path(p).resolve()
+            sz = rp.stat().st_size
+            os.remove(rp)
+            total += sz
+        except Exception:
+            pass
+    return SizeResponse(bytes=total)
+```
+
+---
+
+## backend/app/main.py
+```python
+from fastapi import FastAPI
+from fastapi.middleware.cors import CORSMiddleware
+from .routers import jobs, pairs, files, groups
+
+app = FastAPI(title="Video Duplicates API")
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+app.include_router(jobs.router)
+app.include_router(pairs.router)
+app.include_router(files.router)
+app.include_router(groups.router)
+
+@app.get("/api/health")
+async def health():
+    return {"ok": True}
+```python
+from fastapi import FastAPI
+from fastapi.middleware.cors import CORSMiddleware
+from .routers import jobs, pairs, files
+
+app = FastAPI(title="Video Duplicates API")
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+app.include_router(jobs.router)
+app.include_router(pairs.router)
+app.include_router(files.router)
+
+@app.get("/api/health")
+async def health():
+    return {"ok": True}
+```
+
+---
+
+## frontend/Dockerfile
+```Dockerfile
+FROM node:20-alpine as build
+WORKDIR /app
+COPY package.json vite.config.ts index.html /app/
+COPY src /app/src
+RUN npm ci && npm run build
+
+FROM nginx:alpine
+COPY nginx.conf /etc/nginx/conf.d/default.conf
+COPY --from=build /app/dist /usr/share/nginx/html
+```
+
+---
+
+## frontend/nginx.conf
+```nginx
+server {
+  listen 80 default_server;
+  server_name _;
+
+  location /api/ {
+    proxy_pass http://backend:8000/api/;
+    proxy_set_header Host $host;
+    proxy_set_header X-Real-IP $remote_addr;
+  }
+
+  location / {
+    root   /usr/share/nginx/html;
+    try_files $uri /index.html;
+  }
+}
+```
+
+---
+
+## frontend/package.json
+```json
+{
+  "name": "video-dupes-ui",
+  "version": "0.1.0",
+  "private": true,
+  "scripts": {
+    "dev": "vite",
+    "build": "vite build",
+    "preview": "vite preview --port 5173"
+  },
+  "dependencies": {
+    "react": "18.3.1",
+    "react-dom": "18.3.1",
+    "axios": "1.7.7"
+  },
+  "devDependencies": {
+    "typescript": "5.5.4",
+    "vite": "5.4.2",
+    "@types/react": "18.3.5",
+    "@types/react-dom": "18.3.0"
+  }
+}
+```
+
+---
+
+## frontend/vite.config.ts
+```ts
+import { defineConfig } from 'vite'
+import react from '@vitejs/plugin-react'
+
+export default defineConfig({
+  plugins: [react()],
+})
+```
+
+---
+
+## frontend/index.html
+```html
+<!doctype html>
+<html>
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Video Duplicates</title>
+  </head>
+  <body>
+    <div id="root"></div>
+    <script type="module" src="/src/main.tsx"></script>
+  </body>
+</html>
+```
+
+---
+
+## frontend/src/types.ts
+```ts
+export type Job = {
+  id: number;
+  status: 'queued'|'running'|'done'|'error';
+  created_at: string;
+  started_at?: string;
+  finished_at?: string;
+  error?: string;
+}
+
+export type Pair = {
+  id: number;
+  similarity: number;
+  label: string;
+  file_a: string; size_a: number; duration_a: number; res_a: string;
+  file_b: string; size_b: number; duration_b: number; res_b: string;
+}
+
+export type GroupFile = {
+  id: number;
+  path: string;
+  size: number;
+  duration: number;
+  res: string;
+  is_representative: boolean;
+}
+
+export type Group = {
+  id: number;
+  job_id: number;
+  representative_path: string;
+  count: number;
+  total_size: number;
+  files: GroupFile[];
+}
+```ts
+export type Job = {
+  id: number;
+  status: 'queued'|'running'|'done'|'error';
+  created_at: string;
+  started_at?: string;
+  finished_at?: string;
+  error?: string;
+}
+
+export type Pair = {
+  id: number;
+  similarity: number;
+  label: string;
+  file_a: string; size_a: number; duration_a: number; res_a: string;
+  file_b: string; size_b: number; duration_b: number; res_b: string;
+}
+```
+
+---
+
+## frontend/src/api.ts
+```ts
+import axios from 'axios';
+
+const api = axios.create({ baseURL: '/api' });
+
+export const startJob = async (payload: {roots: string[], frames: number, scale: number, threshold: number, exts: string[]}) => {
+  const { data } = await api.post('/jobs', payload);
+  return data;
+}
+
+export const getJob = async (id: number) => {
+  const { data } = await api.get(`/jobs/${id}`);
+  return data;
+}
+
+export const listPairs = async (jobId: number) => {
+  const { data } = await api.get(`/pairs/${jobId}`);
+  return data;
+}
+
+export const listGroups = async (jobId: number) => {
+  const { data } = await api.get(`/groups/${jobId}`);
+  return data;
+}
+
+export const getSize = async (paths: string[]) => {
+  const { data } = await api.post('/files/size', { paths });
+  return data as { bytes: number };
+}
+
+export const deleteFiles = async (paths: string[]) => {
+  const { data } = await api.post('/files/delete', { paths });
+  return data as { bytes: number };
+}
+
+export const groupSize = async (groupId: number, paths?: string[]) => {
+  const { data } = await api.post(`/groups/${groupId}/size`, { paths });
+  return data as { bytes: number };
+}
+
+export const groupDelete = async (groupId: number, paths?: string[]) => {
+  const { data } = await api.post(`/groups/${groupId}/delete`, { paths });
+  return data as { bytes: number };
+}
+
+export default api;
+```ts
+import axios from 'axios';
+
+const api = axios.create({ baseURL: '/api' });
+
+export const startJob = async (payload: {roots: string[], frames: number, scale: number, threshold: number, exts: string[]}) => {
+  const { data } = await api.post('/jobs', payload);
+  return data;
+}
+
+export const getJob = async (id: number) => {
+  const { data } = await api.get(`/jobs/${id}`);
+  return data;
+}
+
+export const listPairs = async (jobId: number) => {
+  const { data } = await api.get(`/pairs/${jobId}`);
+  return data;
+}
+
+export const getSize = async (paths: string[]) => {
+  const { data } = await api.post('/files/size', { paths });
+  return data as { bytes: number };
+}
+
+export const deleteFiles = async (paths: string[]) => {
+  const { data } = await api.post('/files/delete', { paths });
+  return data as { bytes: number };
+}
+
+export default api;
+```
+
+---
+
+## frontend/src/components/JobForm.tsx
+```tsx
+import React, { useState } from 'react';
+import { startJob } from '../api';
+
+type Props = { onStarted: (jobId:number)=>void; defaultRoots: string[] };
+
+export default function JobForm({ onStarted, defaultRoots }: Props){
+  const [roots, setRoots] = useState<string>(defaultRoots.join(','));
+  const [frames, setFrames] = useState(20);
+  const [scale, setScale] = useState(320);
+  const [threshold, setThreshold] = useState(0.88);
+  const [exts, setExts] = useState('.mp4,.mkv,.avi,.mov,.m4v,.webm,.ts,.mts,.m2ts,.wmv,.flv');
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+
+  const submit = async (e: React.FormEvent) => {
+    e.preventDefault();
+    setBusy(true); setError(null);
+    try {
+      const job = await startJob({
+        roots: roots.split(',').map(s=>s.trim()).filter(Boolean),
+        frames, scale, threshold,
+        exts: exts.split(',').map(s=>s.trim()).filter(Boolean),
+      });
+      onStarted(job.id);
+    } catch (err:any){
+      setError(err?.response?.data?.detail || err.message);
+    } finally { setBusy(false); }
+  }
+
+  return (
+    <form onSubmit={submit} style={{display:'grid', gap:8, gridTemplateColumns:'1fr 1fr'}}>
+      <label style={{gridColumn:'1/3'}}>Корни (внутри контейнера):
+        <input value={roots} onChange={e=>setRoots(e.target.value)} placeholder="/videos/dir1,/videos/dir2"/>
+      </label>
+      <label>Кадров на видео
+        <input type="number" value={frames} onChange={e=>setFrames(parseInt(e.target.value))}/>
+      </label>
+      <label>Scale ширина (0=off)
+        <input type="number" value={scale} onChange={e=>setScale(parseInt(e.target.value))}/>
+      </label>
+      <label>Порог похожести
+        <input type="number" step="0.01" min={0.5} max={1} value={threshold} onChange={e=>setThreshold(parseFloat(e.target.value))}/>
+      </label>
+      <label style={{gridColumn:'1/3'}}>Расширения
+        <input value={exts} onChange={e=>setExts(e.target.value)}/>
+      </label>
+      <div style={{gridColumn:'1/3'}}>
+        <button disabled={busy} type="submit">Запустить</button>
+        {busy && <span style={{marginLeft:8}}>Стартуем…</span>}
+        {error && <div style={{color:'red'}}>{error}</div>}
+      </div>
+    </form>
+  );
+}
+```tsx
+import React, { useState } from 'react';
+import { startJob } from '../api';
+
+type Props = { onStarted: (jobId:number)=>void; defaultRoots: string[] };
+
+export default function JobForm({ onStarted, defaultRoots }: Props){
+  const [roots, setRoots] = useState<string>(defaultRoots.join(','));
+  const [frames, setFrames] = useState(20);
+  const [scale, setScale] = useState(320);
+  const [threshold, setThreshold] = useState(0.88);
+  const [exts, setExts] = useState('.mp4,.mkv,.avi,.mov,.m4v,.webm,.ts,.mts,.m2ts,.wmv,.flv');
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+
+  const submit = async (e: React.FormEvent) => {
+    e.preventDefault();
+    setBusy(true); setError(null);
+    try {
+      const job = await startJob({
+        roots: roots.split(',').map(s=>s.trim()).filter(Boolean),
+        frames, scale, threshold,
+        exts: exts.split(',').map(s=>s.trim()).filter(Boolean),
+      });
+      onStarted(job.id);
+    } catch (err:any){
+      setError(err?.response?.data?.detail || err.message);
+    } finally { setBusy(false); }
+  }
+
+  return (
+    <form onSubmit={submit} style={{display:'grid', gap:8, gridTemplateColumns:'1fr 1fr'}}>
+      <label style={{gridColumn:'1/3'}}>Корни (внутри контейнера):
+        <input value={roots} onChange={e=>setRoots(e.target.value)} placeholder="/videos/dir1,/videos/dir2"/>
+      </label>
+      <label>Кадров на видео
+        <input type="number" value={frames} onChange={e=>setFrames(parseInt(e.target.value))}/>
+      </label>
+      <label>Scale ширина (0=off)
+        <input type="number" value={scale} onChange={e=>setScale(parseInt(e.target.value))}/>
+      </label>
+      <label>Порог похожести
+        <input type="number" step="0.01" min={0.5} max={1} value={threshold} onChange={e=>setThreshold(parseFloat(e.target.value))}/>
+      </label>
+      <label style={{gridColumn:'1/3'}}>Расширения
+        <input value={exts} onChange={e=>setExts(e.target.value)}/>
+      </label>
+      <div style={{gridColumn:'1/3'}}>
+        <button disabled={busy} type="submit">Запустить</button>
+        {busy && <span style={{marginLeft:8}}>Стартуем…</span>}
+        {error && <div style={{color:'red'}}>{error}</div>}
+      </div>
+    </form>
+  );
+}
+```
+
+---
+
+## frontend/src/components/PairsTable.tsx
+```tsx
+import React, { useMemo, useState } from 'react';
+import { Pair } from '../types';
+import { deleteFiles, getSize } from '../api';
+import SizeBar from './SizeBar';
+
+type Props = { pairs: Pair[] };
+
+export default function PairsTable({ pairs }: Props){
+  const [selected, setSelected] = useState<Record<string, boolean>>({});
+  const [bytes, setBytes] = useState<number>(0);
+  const [busy, setBusy] = useState(false);
+
+  const toggle = (p: string) => setSelected(s=> ({...s, [p]: !s[p]}));
+  const paths = useMemo(()=> Object.keys(selected).filter(k=>selected[k]), [selected]);
+
+  const calcSize = async () => {
+    setBusy(true);
+    try{ const res = await getSize(paths); setBytes(res.bytes);} finally{ setBusy(false); }
+  };
+
+  const remove = async () => {
+    if (!paths.length) return;
+    if (!confirm(`Удалить ${paths.length} файлов?`)) return;
+    setBusy(true);
+    try{ const res = await deleteFiles(paths); alert(`Удалено ~${(res.bytes/1e9).toFixed(2)} ГБ`); }
+    finally{ setBusy(false); }
+  };
+
+  return (
+    <div>
+      <div style={{marginBottom:8, display:'flex', gap:8, alignItems:'center'}}>
+        <button onClick={calcSize} disabled={!paths.length || busy}>Посчитать объём</button>
+        <button onClick={remove} disabled={!paths.length || busy} style={{color:'white', background:'#c00'}}>Удалить выбранные</button>
+        <SizeBar bytes={bytes} />
+      </div>
+      <table style={{width:'100%', borderCollapse:'collapse'}}>
+        <thead>
+          <tr>
+            <th>✔</th>
+            <th>Similarity</th>
+            <th>Label</th>
+            <th>File A</th>
+            <th>File B</th>
+          </tr>
+        </thead>
+        <tbody>
+          {pairs.map((p, idx)=> (
+            <tr key={idx} style={{borderTop:'1px solid #eee'}}>
+              <td>
+                <input type="checkbox" onChange={()=>toggle(p.file_b)} title="Обычно выбираем удалить B" />
+              </td>
+              <td>{(p.similarity*100).toFixed(2)}%</td>
+              <td>{p.label}</td>
+              <td>
+                <div>{p.file_a}</div>
+                <div style={{fontSize:12, opacity:0.7}}>{p.res_a} • {(p.duration_a||0).toFixed(1)} s • {(p.size_a/1e6).toFixed(1)} MB</div>
+              </td>
+              <td>
+                <div>{p.file_b}</div>
+                <div style={{fontSize:12, opacity:0.7}}>{p.res_b} • {(p.duration_b||0).toFixed(1)} s • {(p.size_b/1e6).toFixed(1)} MB</div>
+              </td>
+            </tr>
+          ))}
+        </tbody>
+      </table>
+    </div>
+  );
+}
+```tsx
+import React, { useMemo, useState } from 'react';
+import { Pair } from '../types';
+import { deleteFiles, getSize } from '../api';
+import SizeBar from './SizeBar';
+
+type Props = { pairs: Pair[] };
+
+export default function PairsTable({ pairs }: Props){
+  const [selected, setSelected] = useState<Record<string, boolean>>({});
+  const [bytes, setBytes] = useState<number>(0);
+  const [busy, setBusy] = useState(false);
+  const allSelected = useMemo(()=>Object.values(selected).every(Boolean) && Object.keys(selected).length>0, [selected]);
+
+  const toggle = (p: string) => setSelected(s=> ({...s, [p]: !s[p]}));
+
+  const paths = useMemo(()=> Object.keys(selected).filter(k=>selected[k]), [selected]);
+
+  const calcSize = async () => {
+    setBusy(true);
+    try{ const res = await getSize(paths); setBytes(res.bytes);} finally{ setBusy(false); }
+  };
+
+  const remove = async () => {
+    if (!paths.length) return;
+    if (!confirm(`Удалить ${paths.length} файлов?`)) return;
+    setBusy(true);
+    try{ const res = await deleteFiles(paths); alert(`Удалено ~${(res.bytes/1e9).toFixed(2)} ГБ`); }
+    finally{ setBusy(false); }
+  };
+
+  return (
+    <div>
+      <div style={{marginBottom:8, display:'flex', gap:8, alignItems:'center'}}>
+        <button onClick={calcSize} disabled={!paths.length || busy}>Посчитать объём</button>
+        <button onClick={remove} disabled={!paths.length || busy} style={{color:'white', background:'#c00'}}>Удалить выбранные</button>
+        <SizeBar bytes={bytes} />
+      </div>
+      <table style={{width:'100%', borderCollapse:'collapse'}}>
+        <thead>
+          <tr>
+            <th>✔</th>
+            <th>Similarity</th>
+            <th>Label</th>
+            <th>File A</th>
+            <th>File B</th>
+          </tr>
+        </thead>
+        <tbody>
+          {pairs.map(p=> (
+            <tr key={p.id} style={{borderTop:'1px solid #eee'}}>
+              <td>
+                <input type="checkbox" onChange={()=>toggle(p.file_b)} title="Обычно выбираем удалить B" />
+              </td>
+              <td>{(p.similarity*100).toFixed(2)}%</td>
+              <td>{p.label}</td>
+              <td>
+                <div>{p.file_a}</div>
+                <div style={{fontSize:12, opacity:0.7}}>{p.res_a} • {(p.duration_a||0).toFixed(1)} s • {(p.size_a/1e6).toFixed(1)} MB</div>
+              </td>
+              <td>
+                <div>{p.file_b}</div>
+                <div style={{fontSize:12, opacity:0.7}}>{p.res_b} • {(p.duration_b||0).toFixed(1)} s • {(p.size_b/1e6).toFixed(1)} MB</div>
+              </td>
+            </tr>
+          ))}
+        </tbody>
+      </table>
+    </div>
+  );
+}
+```
+
+---
+
+## frontend/src/components/SizeBar.tsx
+```tsx
+import React from 'react';
+
+export default function SizeBar({ bytes }: { bytes: number }){
+  if (!bytes) return null;
+  const gb = bytes / 1e9;
+  return <div style={{marginLeft:8, fontWeight:600}}>{gb.toFixed(2)} ГБ</div>;
+}
+```
+
+---
+
+## frontend/src/components/GroupsTable.tsx
+```tsx
+import React, { useMemo, useState } from 'react';
+import { Group } from '../types';
+import { groupDelete, groupSize } from '../api';
+import SizeBar from './SizeBar';
+
+type Props = { groups: Group[] };
+
+export default function GroupsTable({ groups }: Props){
+  const [selected, setSelected] = useState<Record<number, Record<string, boolean>>>({});
+  const [bytes, setBytes] = useState<number>(0);
+  const [busy, setBusy] = useState(false);
+
+  const toggle = (gid: number, path: string) => setSelected(s=> ({
+    ...s,
+    [gid]: { ...(s[gid]||{}), [path]: !(s[gid]?.[path]) }
+  }));
+
+  const computePaths = (g: Group): string[] => {
+    const sel = selected[g.id] || {};
+    const marked = Object.keys(sel).filter(k=>sel[k]);
+    if (marked.length) return marked;
+    // по умолчанию — все кроме эталона
+    return g.files.filter(f=>!f.is_representative).map(f=>f.path);
+  };
+
+  const calcSize = async (g: Group) => {
+    setBusy(true);
+    try{ const res = await groupSize(g.id, computePaths(g)); setBytes(res.bytes);} finally{ setBusy(false); }
+  };
+
+  const remove = async (g: Group) => {
+    const paths = computePaths(g);
+    if (!paths.length) return;
+    if (!confirm(`Удалить ${paths.length} файлов в группе #${g.id}?`)) return;
+    setBusy(true);
+    try{ const res = await groupDelete(g.id, paths); alert(`Удалено ~${(res.bytes/1e9).toFixed(2)} ГБ`); }
+    finally{ setBusy(false); }
+  };
+
+  return (
+    <div>
+      {groups.map(g=> (
+        <div key={g.id} style={{border:'1px solid #eee', borderRadius:8, padding:12, marginBottom:12}}>
+          <div style={{display:'flex', justifyContent:'space-between', alignItems:'center'}}>
+            <div>
+              <b>Группа #{g.id}</b> — файлов: {g.count} • общий размер: {(g.total_size/1e9).toFixed(2)} ГБ
+              <div style={{fontSize:12, opacity:0.7}}>Эталон: {g.representative_path}</div>
+            </div>
+            <div style={{display:'flex', gap:8, alignItems:'center'}}>
+              <button onClick={()=>calcSize(g)} disabled={busy}>Посчитать объём выбранных</button>
+              <button onClick={()=>remove(g)} disabled={busy} style={{color:'white', background:'#c00'}}>Удалить выбранные</button>
+              <SizeBar bytes={bytes} />
+            </div>
+          </div>
+          <table style={{width:'100%', marginTop:8, borderCollapse:'collapse'}}>
+            <thead>
+              <tr>
+                <th>✔</th>
+                <th>Путь</th>
+                <th>Длит.</th>
+                <th>Разрешение</th>
+                <th>Размер</th>
+                <th>Роль</th>
+              </tr>
+            </thead>
+            <tbody>
+              {g.files.map(f=> (
+                <tr key={f.id} style={{borderTop:'1px solid #eee'}}>
+                  <td>
+                    <input type="checkbox" onChange={()=>toggle(g.id, f.path)} defaultChecked={!f.is_representative} />
+                  </td>
+                  <td>{f.path}</td>
+                  <td>{(f.duration||0).toFixed(1)} s</td>
+                  <td>{f.res}</td>
+                  <td>{(f.size/1e6).toFixed(1)} MB</td>
+                  <td>{f.is_representative ? 'эталон' : ''}</td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      ))}
+    </div>
+  );
+}
+```
+
+## frontend/src/main.tsx
+```tsx
+import React from 'react'
+import { createRoot } from 'react-dom/client'
+import App from './App'
+
+createRoot(document.getElementById('root')!).render(
+  <React.StrictMode>
+    <App />
+  </React.StrictMode>
+)
+```
+
+---
+
+## frontend/src/App.tsx
+```tsx
+import React, { useEffect, useState } from 'react';
+import JobForm from './components/JobForm';
+import { getJob, listPairs, listGroups } from './api';
+import { Job, Pair, Group } from './types';
+
+const DEFAULT_ROOTS = (import.meta.env.VITE_DEFAULT_ROOTS || '/videos/dir1,/videos/dir2').split(',');
+
+export default function App(){
+  const [jobId, setJobId] = useState<number | null>(null);
+  const [job, setJob] = useState<Job | null>(null);
+  const [pairs, setPairs] = useState<Pair[]>([]);
+  const [groups, setGroups] = useState<Group[]>([]);
+  const [tab, setTab] = useState<'pairs'|'groups'>('groups');
+
+  useEffect(()=>{
+    let t: number | undefined;
+    if (jobId){
+      const poll = async ()=>{
+        const j = await getJob(jobId);
+        setJob(j);
+        if (j.status === 'done'){
+          const [ps, gs] = await Promise.all([listPairs(jobId), listGroups(jobId)]);
+          setPairs(ps); setGroups(gs);
+          window.clearInterval(t);
+        }
+      };
+      poll();
+      t = window.setInterval(poll, 2000);
+    }
+    return ()=> t && window.clearInterval(t);
+  }, [jobId]);
+
+  return (
+    <div style={{maxWidth:1200, margin:'0 auto', padding:24}}>
+      <h1>Video Duplicates</h1>
+      <JobForm onStarted={setJobId} defaultRoots={DEFAULT_ROOTS} />
+
+      {job && (
+        <div style={{marginTop:16}}>
+          <b>Задача #{job.id}</b> — {job.status}
+          {job.error && <div style={{color:'red'}}>{job.error}</div>}
+        </div>
+      )}
+
+      {(pairs.length>0 || groups.length>0) && (
+        <div style={{marginTop:16}}>
+          <div style={{display:'flex', gap:8}}>
+            <button onClick={()=>setTab('groups')} disabled={tab==='groups'}>Группы</button>
+            <button onClick={()=>setTab('pairs')} disabled={tab==='pairs'}>Пары</button>
+          </div>
+          <hr/>
+          {tab==='groups' ? <GroupsTable groups={groups}/> : <PairsTable pairs={pairs} />}
+        </div>
+      )}
+    </div>
+  );
+}
+
+// Вырезано импортом для снижения шума типов
+import PairsTable from './components/PairsTable';
+import GroupsTable from './components/GroupsTable';
+```tsx
+import React, { useEffect, useState } from 'react';
+import JobForm from './components/JobForm';
+import { getJob, listPairs } from './api';
+import { Job, Pair } from './types';
+
+const DEFAULT_ROOTS = (import.meta.env.VITE_DEFAULT_ROOTS || '/videos/dir1,/videos/dir2').split(',');
+
+export default function App(){
+  const [jobId, setJobId] = useState<number | null>(null);
+  const [job, setJob] = useState<Job | null>(null);
+  const [pairs, setPairs] = useState<Pair[]>([]);
+
+  useEffect(()=>{
+    let t: number | undefined;
+    if (jobId){
+      const poll = async ()=>{
+        const j = await getJob(jobId);
+        setJob(j);
+        if (j.status === 'done'){
+          const ps = await listPairs(jobId);
+          setPairs(ps);
+          window.clearInterval(t);
+        }
+      };
+      poll();
+      t = window.setInterval(poll, 2000);
+    }
+    return ()=> t && window.clearInterval(t);
+  }, [jobId]);
+
+  return (
+    <div style={{maxWidth:1200, margin:'0 auto', padding:24}}>
+      <h1>Video Duplicates</h1>
+      <JobForm onStarted={setJobId} defaultRoots={DEFAULT_ROOTS} />
+
+      {job && (
+        <div style={{marginTop:16}}>
+          <b>Задача #{job.id}</b> — {job.status}
+          {job.error && <div style={{color:'red'}}>{job.error}</div>}
+        </div>
+      )}
+
+      {pairs.length>0 && (
+        <div style={{marginTop:16}}>
+          <h3>Дубликаты / похожие</h3>
+          <p>Отмечай, что удалить (обычно правую колонку B), посчитай объём и удали.</p>
+          <hr/>
+          {/* @ts-ignore */}
+          <PairsTable pairs={pairs} />
+        </div>
+      )}
+    </div>
+  );
+}
+
+// Вырезано импортом для снижения шума типов
+import PairsTable from './components/PairsTable';
+```
+
+---
+
+## README.md
+```md
+# Video Duplicates — FastAPI + React + Docker Compose
+
+Веб-интерфейс для поиска дублей/похожих видео. Сервер считает перцептивные хеши кадров через ffmpeg и ищет совпадения, UI позволяет запускать задачи, просматривать пары, считать суммарный размер выбранных файлов и удалять их.
+
+## Запуск
+
+1. Подготовь `.env` из примера и пропиши реальные пути к видео:
+
+```bash
+cp .env.example .env
+# Отредактируй HOST_VIDEO_DIR1/2
+```
+
+2. Запусти:
+
+```bash
+docker compose up --build
+```
+
+3. Открой UI: http://localhost:8080  (API: http://localhost:8080/api)
+
+> **Важно:** Папки с видео смонтированы в контейнер `backend` как `/videos/dir1` и `/videos/dir2` (read-only). В UI указывай именно эти пути.
+
+## Как это работает
+- Backend (FastAPI) запускает задачу, сканирует видео, извлекает K кадров на видео, считает pHash (Pillow+ImageHash) и сравнивает последовательности со скользящим окном.
+- Результаты сохраняются в Postgres и отображаются во фронтенде.
+- Удаление файлов выполняется через API по абсолютным путям (осторожно!).
+
+## Тюнинг
+- `DEFAULT_FRAMES`, `DEFAULT_SCALE`, `DEFAULT_THRESHOLD` в `docker-compose.yml`
+- В форме UI можно переопределить параметры на запуск
+
+## Безопасность
+- Базовая проверка ограничивает доступ к папкам, которые перечислены в `VIDEO_ROOTS` и реально примонтированы в контейнер.
+- Рекомендация: запускай стек локально или в доверенной сети. Для удалённого доступа добавь аутентификацию (например, базовый OAuth2 в FastAPI) и сделай бэкап БД.
+
+---
+
+## backend/alembic.ini
+```ini
+[alembic]
+script_location = alembic
+sqlalchemy.url = %(DATABASE_URL)s
+
+[loggers]
+keys = root,sqlalchemy,alembic
+
+[handlers]
+keys = console
+
+[formatters]
+keys = generic
+
+[logger_root]
+level = WARN
+handlers = console
+
+[logger_sqlalchemy]
+level = WARN
+handlers =
+qualname = sqlalchemy.engine
+
+[logger_alembic]
+level = INFO
+handlers =
+qualname = alembic
+
+[handler_console]
+class = StreamHandler
+args = (sys.stderr,)
+level = NOTSET
+formatter = generic
+
+[formatter_generic]
+format = %(levelname)-5.5s [%(name)s] %(message)s
+```
+
+---
+
+## backend/alembic/env.py
+```python
+from logging.config import fileConfig
+from sqlalchemy import engine_from_config, pool
+from alembic import context
+import os
+
+from app.db import Base
+from app import models  # noqa: F401
+
+config = context.config
+
+db_url = os.getenv("DATABASE_URL")
+if db_url:
+    config.set_main_option("sqlalchemy.url", db_url)
+
+if config.config_file_name is not None:
+    fileConfig(config.config_file_name)
+
+target_metadata = Base.metadata
+
+def run_migrations_offline():
+    url = config.get_main_option("sqlalchemy.url")
+    context.configure(url=url, target_metadata=target_metadata, literal_binds=True)
+    with context.begin_transaction():
+        context.run_migrations()
+
+def run_migrations_online():
+    connectable = engine_from_config(
+        config.get_section(config.config_ini_section),
+        prefix="sqlalchemy.",
+        poolclass=pool.NullPool,
+    )
+    with connectable.connect() as connection:
+        context.configure(connection=connection, target_metadata=target_metadata)
+        with context.begin_transaction():
+            context.run_migrations()
+
+if context.is_offline_mode():
+    run_migrations_offline()
+else:
+    run_migrations_online()
+```
+
+---
+
+## backend/alembic/versions/20250815_000000_init.py
+```python
+from alembic import op
+import sqlalchemy as sa
+
+revision = '20250815_000000_init'
+down_revision = None
+branch_labels = None
+depends_on = None
+
+def upgrade():
+    op.create_table(
+        'jobs',
+        sa.Column('id', sa.Integer(), primary_key=True),
+        sa.Column('status', sa.String(length=32), nullable=True),
+        sa.Column('params', sa.Text(), nullable=False),
+        sa.Column('created_at', sa.DateTime(), nullable=True),
+        sa.Column('started_at', sa.DateTime(), nullable=True),
+        sa.Column('finished_at', sa.DateTime(), nullable=True),
+        sa.Column('error', sa.Text(), nullable=True),
+    )
+
+    op.create_table(
+        'pairs',
+        sa.Column('id', sa.Integer(), primary_key=True),
+        sa.Column('job_id', sa.Integer(), sa.ForeignKey('jobs.id', ondelete='CASCADE'), index=True),
+        sa.Column('similarity', sa.Float(), index=True),
+        sa.Column('label', sa.String(length=32)),
+        sa.Column('file_a', sa.Text(), nullable=False),
+        sa.Column('size_a', sa.BigInteger()),
+        sa.Column('duration_a', sa.Float()),
+        sa.Column('res_a', sa.String(length=32)),
+        sa.Column('file_b', sa.Text(), nullable=False),
+        sa.Column('size_b', sa.BigInteger()),
+        sa.Column('duration_b', sa.Float()),
+        sa.Column('res_b', sa.String(length=32)),
+    )
+
+    op.create_table(
+        'groups',
+        sa.Column('id', sa.Integer(), primary_key=True),
+        sa.Column('job_id', sa.Integer(), sa.ForeignKey('jobs.id', ondelete='CASCADE'), index=True),
+        sa.Column('representative_path', sa.Text(), nullable=False),
+        sa.Column('count', sa.Integer(), nullable=False, server_default='0'),
+        sa.Column('total_size', sa.BigInteger(), nullable=False, server_default='0'),
+    )
+
+    op.create_table(
+        'group_files',
+        sa.Column('id', sa.Integer(), primary_key=True),
+        sa.Column('group_id', sa.Integer(), sa.ForeignKey('groups.id', ondelete='CASCADE'), index=True),
+        sa.Column('path', sa.Text(), nullable=False),
+        sa.Column('size', sa.BigInteger()),
+        sa.Column('duration', sa.Float()),
+        sa.Column('res', sa.String(length=32)),
+        sa.Column('is_representative', sa.Boolean(), nullable=False, server_default=sa.text('false')),
+    )
+
+def downgrade():
+    op.drop_table('group_files')
+    op.drop_table('groups')
+    op.drop_table('pairs')
+    op.drop_table('jobs')
+```python
+from alembic import op
+import sqlalchemy as sa
+
+revision = '20250815_000000_init'
+down_revision = None
+branch_labels = None
+depends_on = None
+
+def upgrade():
+    op.create_table(
+        'jobs',
+        sa.Column('id', sa.Integer(), primary_key=True),
+        sa.Column('status', sa.String(length=32), nullable=True),
+        sa.Column('params', sa.Text(), nullable=False),
+        sa.Column('created_at', sa.DateTime(), nullable=True),
+        sa.Column('started_at', sa.DateTime(), nullable=True),
+        sa.Column('finished_at', sa.DateTime(), nullable=True),
+        sa.Column('error', sa.Text(), nullable=True),
+    )
+
+    op.create_table(
+        'pairs',
+        sa.Column('id', sa.Integer(), primary_key=True),
+        sa.Column('job_id', sa.Integer(), sa.ForeignKey('jobs.id', ondelete='CASCADE'), index=True),
+        sa.Column('similarity', sa.Float(), index=True),
+        sa.Column('label', sa.String(length=32)),
+        sa.Column('file_a', sa.Text(), nullable=False),
+        sa.Column('size_a', sa.BigInteger()),
+        sa.Column('duration_a', sa.Float()),
+        sa.Column('res_a', sa.String(length=32)),
+        sa.Column('file_b', sa.Text(), nullable=False),
+        sa.Column('size_b', sa.BigInteger()),
+        sa.Column('duration_b', sa.Float()),
+        sa.Column('res_b', sa.String(length=32)),
+    )
+
+def downgrade():
+    op.drop_table('pairs')
+    op.drop_table('jobs')
+```
+
+---
+
+## backend/entrypoint.sh
+```bash
+#!/usr/bin/env bash
+set -euo pipefail
+
+export DATABASE_URL
+
+alembic upgrade head
+
+exec uvicorn app.main:app --host 0.0.0.0 --port 8000
+```
+
+---
+
+## Примечание по Alembic
+В контейнере `backend` миграции применяются автоматически при старте через `entrypoint.sh`. Для разработки:
+
+```bash
+docker compose exec backend alembic revision -m "change"
+docker compose exec backend alembic upgrade head
+```
