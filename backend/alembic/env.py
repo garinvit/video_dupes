@@ -1,25 +1,28 @@
+# backend/alembic/env.py
 from logging.config import fileConfig
-from sqlalchemy import engine_from_config, pool
 from alembic import context
+from sqlalchemy import engine_from_config, pool
 import os
 import sys
+import pathlib
 
-# Добавляем путь к app
-sys.path.append(os.path.dirname(os.path.abspath(__file__)))
-sys.path.append(os.path.dirname(os.path.abspath(__file__)) + "/..")
+# Добавляем путь к backend/, чтобы импортировать app.*
+BASE_DIR = pathlib.Path(__file__).resolve().parents[1]
+APP_DIR = BASE_DIR / "app"
+sys.path.append(str(BASE_DIR))
+sys.path.append(str(APP_DIR.parent))
 
-from app.db import Base  # noqa
-from app import models    # noqa  # импорт моделей важен, чтобы metadata знала о таблицах
-
-# this is the Alembic Config object
+# Импортирует Base и одновременно триггерит сборку DATABASE_URL из POSTGRES_*
+from app.db import Base, DATABASE_URL  # noqa
 config = context.config
 
-# Передадим URL из переменной окружения
-database_url = os.getenv("DATABASE_URL")
-if database_url:
-    config.set_main_option("sqlalchemy.url", database_url)
+# Установим URL для Alembic из окружения (которое уже заполнили в app.db)
+database_url = os.getenv("DATABASE_URL", DATABASE_URL)
+if not database_url:
+    raise RuntimeError("DATABASE_URL is not set and could not be constructed")
+config.set_main_option("sqlalchemy.url", database_url)
 
-# Interpret the config file for Python logging.
+# Логи
 if config.config_file_name is not None:
     fileConfig(config.config_file_name)
 
@@ -27,7 +30,7 @@ target_metadata = Base.metadata
 
 def run_migrations_offline():
     context.configure(
-        url=config.get_main_option("sqlalchemy.url"),
+        url=database_url,
         target_metadata=target_metadata,
         literal_binds=True,
         dialect_opts={"paramstyle": "named"},

@@ -14,6 +14,8 @@ services:
       interval: 5s
       timeout: 3s
       retries: 10
+    ports:
+      - "5432:5432"
 
   backend:
     build: ./backend
@@ -31,15 +33,16 @@ services:
     volumes:
       - ${HOST_VIDEO_DIR1:-.}:/videos/dir1:ro
       - ${HOST_VIDEO_DIR2:-.}:/videos/dir2:ro
-    expose:
-      - "8000"
-
-  frontend:
-    build: ./frontend
-    depends_on:
-      - backend
+    command: ["/entrypoint.sh"]
     ports:
-      - "8080:80"
+      - "8000:8000"
+
+#  frontend:
+#    build: ./frontend
+#    depends_on:
+#      - backend
+#    ports:
+#      - "8080:80"
 
   worker:
     build: ./backend
