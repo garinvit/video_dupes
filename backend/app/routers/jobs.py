@@ -36,3 +36,14 @@ def get_job(job_id: int, db: Session = Depends(get_db)):
     if not job:
         raise HTTPException(status_code=404, detail="Job not found")
     return schemas.JobOut.model_validate(job)
+
+@router.get("/defaults")
+def get_defaults():
+    import os
+    roots = os.getenv("VIDEO_ROOTS", "/videos/dir1,/videos/dir2").split(",")
+    return {
+        "roots": [r.strip() for r in roots if r.strip()],
+        "frames": int(os.getenv("DEFAULT_FRAMES", "20")),
+        "scale": int(os.getenv("DEFAULT_SCALE", "320")),
+        "threshold": float(os.getenv("DEFAULT_THRESHOLD", "0.88")),
+    }
