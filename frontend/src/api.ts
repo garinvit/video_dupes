@@ -30,11 +30,10 @@ export async function startJob(payload: {
   return r.json();
 }
 
+// строим строку сами, без new URL
 export async function getPairs(jobId: number, limit = 100, offset = 0): Promise<{ data: PairOut[]; total: number; }> {
-  const url = new URL(`${API}/jobs/${jobId}/pairs`, window.location.origin);
-  url.searchParams.set("limit", String(limit));
-  url.searchParams.set("offset", String(offset));
-  const r = await fetch(url.toString().replace(window.location.origin, ""));
+  const qs = new URLSearchParams({ limit: String(limit), offset: String(offset) }).toString();
+  const r = await fetch(`${API}/jobs/${jobId}/pairs?${qs}`);
   if (!r.ok) throw new Error("pairs failed");
   const total = Number(r.headers.get("X-Total-Count") || "0");
   const data = await r.json() as PairOut[];
@@ -42,10 +41,8 @@ export async function getPairs(jobId: number, limit = 100, offset = 0): Promise<
 }
 
 export async function getGroups(jobId: number, limit = 100, offset = 0): Promise<{ data: GroupOut[]; total: number; }> {
-  const url = new URL(`${API}/jobs/${jobId}/groups`, window.location.origin);
-  url.searchParams.set("limit", String(limit));
-  url.searchParams.set("offset", String(offset));
-  const r = await fetch(url.toString().replace(window.location.origin, ""));
+  const qs = new URLSearchParams({ limit: String(limit), offset: String(offset) }).toString();
+  const r = await fetch(`${API}/jobs/${jobId}/groups?${qs}`);
   if (!r.ok) throw new Error("groups failed");
   const total = Number(r.headers.get("X-Total-Count") || "0");
   const data = await r.json() as GroupOut[];
@@ -53,12 +50,12 @@ export async function getGroups(jobId: number, limit = 100, offset = 0): Promise
 }
 
 export async function getFramesBase64(path: string, count = 3, scale = 320): Promise<{ frames: string[] }> {
-  const url = new URL(`${API}/files/frames`, window.location.origin);
-  url.pathname = `${API}/files/frames`;
-  url.searchParams.set("path", path);
-  url.searchParams.set("count", String(count));
-  url.searchParams.set("scale", String(scale));
-  const r = await fetch(url.toString().replace(window.location.origin, ""));
+  const qs = new URLSearchParams({
+    path,
+    count: String(count),
+    scale: String(scale),
+  }).toString();
+  const r = await fetch(`${API}/files/frames?${qs}`);
   if (!r.ok) throw new Error("frames failed");
   return r.json() as Promise<{ frames: string[] }>;
 }
