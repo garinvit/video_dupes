@@ -1,4 +1,4 @@
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Response, Query
 from sqlalchemy.orm import Session, selectinload
 
 from .. import models, schemas
@@ -6,7 +6,6 @@ from ..db import SessionLocal
 
 router = APIRouter(prefix="/jobs/{job_id}", tags=["duplicates"])
 
-# Dependency to get DB session
 def get_db():
     db = SessionLocal()
     try:
@@ -15,29 +14,54 @@ def get_db():
         db.close()
 
 @router.get("/pairs", response_model=list[schemas.PairOut])
-def get_pairs(job_id: int, db: Session = Depends(get_db)):
-    """Retrieve all duplicate video pairs for a given job."""
-    # Verify job exists (optional, can skip if not required)
+def get_pairs(
+    job_id: int,
+    response: Response,
+    limit: int = Query(100, ge=1, le=1000),
+    offset: int = Query(0, ge=0),
+    db: Session = Depends(get_db),
+):
+    """
+    Пары с пагинацией. Возвращает X-Total-Count.
+    """
     job = db.query(models.Job).get(job_id)
     if not job:
         raise HTTPException(status_code=404, detail="Job not found")
-    # Query all pairs associated with the job, sorted by similarity
-    pairs = db.query(models.Pair).filter(models.Pair.job_id == job_id).order_by(models.Pair.similarity.desc()).all()
+    q = db.query(models.Pair).filter(models.Pair.job_id == job_id)
+    total = q.count()
+    pairs = (
+        q.order_by(models.Pair.similarity.desc())
+         .limit(limit).offset(offset)
+         .all()
+    )
+    response.headers["X-Total-Count"] = str(total)
     return [schemas.PairOut.model_validate(p) for p in pairs]
 
 @router.get("/groups", response_model=list[schemas.GroupOut])
-def get_groups(job_id: int, db: Session = Depends(get_db)):
-    """Retrieve all duplicate file groups for a given job."""
-    # Verify job exists
+def get_groups(
+    job_id: int,
+    response: Response,
+    limit: int = Query(100, ge=1, le=1000),
+    offset: int = Query(0, ge=0),
+    db: Session = Depends(get_db),
+):
+    """
+    Группы с пагинацией. Возвращает X-Total-Count.
+    """
     job = db.query(models.Job).get(job_id)
     if not job:
         raise HTTPException(status_code=404, detail="Job not found")
-    # Load groups and their files for this job (use selectinload for efficiency)
-    groups = db.query(models.Group).options(selectinload(models.Group.files)).filter(models.Group.job_id == job_id).all()
-    # Convert each to GroupOut (includes nested files list)
+    base = db.query(models.Group).filter(models.Group.job_id == job_id)
+    total = base.count()
+    groups = (
+        base.order_by(models.Group.id.asc())
+            .limit(limit).offset(offset)
+            .options(selectinload(models.Group.files))
+            .all()
+    )
     result = []
     for g in groups:
-        # Optionally sort group files so representative comes first
         g.files.sort(key=lambda f: 0 if f.is_representative else 1)
         result.append(schemas.GroupOut.model_validate(g))
+    response.headers["X-Total-Count"] = str(total)
     return result

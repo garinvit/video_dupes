@@ -1,8 +1,6 @@
-"""Main entry for FastAPI application."""
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
-
-from .routers import jobs, pairs, files  # Import routers modules
+from .routers import jobs, pairs, files
 
 app = FastAPI(
     title="Duplicate Video Finder Backend",
@@ -17,7 +15,6 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Include routers from submodules
 app.include_router(jobs.router)
 app.include_router(pairs.router)
 app.include_router(files.router)

@@ -1,66 +1,82 @@
-import React, { useState } from "react";
+import React, { useMemo, useState } from "react";
 import type { PairOut } from "../types";
-import { getFramesBase64 } from "../api";
+import PreviewModal from "./PreviewModal";
 
-type PreviewMap = Record<string, string[]>;
+type SelKey = string; // уникальный ключ для выбранного файла
 
-export default function PairsTable({ pairs }: { pairs: PairOut[] }) {
-  const [previews, setPreviews] = useState<PreviewMap>({});
-  const [loading, setLoading] = useState<Record<string, boolean>>({});
+function keyFor(path: string) { return path; }
 
-  async function loadPreview(path: string) {
-    if (previews[path] || loading[path]) return;
-    setLoading((m) => ({ ...m, [path]: true }));
-    try {
-      const { frames } = await getFramesBase64(path, 3, 320);
-      setPreviews((m) => ({ ...m, [path]: frames }));
-    } catch (e) {
-      setPreviews((m) => ({ ...m, [path]: [] }));
-    } finally {
-      setLoading((m) => ({ ...m, [path]: false }));
+export default function PairsTable({ pairs, onSelectionChange }: {
+  pairs: PairOut[];
+  onSelectionChange?: (selectedPaths: string[], bytes: number) => void;
+}) {
+  const [selected, setSelected] = useState<Record<SelKey, boolean>>({});
+  const [previewPath, setPreviewPath] = useState<string|null>(null);
+
+  const selectedList = useMemo(() => Object.keys(selected).filter(k => selected[k]), [selected]);
+
+  const totalBytes = useMemo(() => {
+    const sizes: Record<string, number> = {};
+    for (const p of pairs) {
+      sizes[p.file_a] = p.size_a;
+      sizes[p.file_b] = p.size_b;
     }
+    return selectedList.reduce((sum, path) => sum + (sizes[path] || 0), 0);
+  }, [selectedList, pairs]);
+
+  function toggle(path: string) {
+    setSelected(prev => {
+      const next = { ...prev, [path]: !prev[path] };
+      onSelectionChange?.(Object.keys(next).filter(k => next[k]), Object.keys(next).filter(k => next[k]).reduce((s, p) => {
+        const found = pairs.find(pp => pp.file_a === p || pp.file_b === p);
+        if (!found) return s;
+        const size = (found.file_a === p) ? found.size_a : found.size_b;
+        return s + (size || 0);
+      }, 0));
+      return next;
+    });
+  }
+
+  function row(filePath: string, size: number, duration: number, res: string) {
+    const k = keyFor(filePath);
+    const checked = !!selected[k];
+    return (
+      <div style={{ display: "grid", gridTemplateColumns: "24px 1fr auto", gap: 6, alignItems: "center" }}>
+        <input type="checkbox" checked={checked} onChange={()=>toggle(filePath)} />
+        <div style={{ overflow: "hidden", textOverflow: "ellipsis" }} title={`${filePath}\n${size} bytes, ${duration.toFixed(1)}s, ${res}`}>
+          {filePath}
+        </div>
+        <div style={{ display: "flex", gap: 6 }}>
+          <button onClick={()=>setPreviewPath(filePath)}>Preview</button>
+        </div>
+      </div>
+    );
   }
 
   return (
-    <table style={{ width: "100%", borderCollapse: "collapse" }}>
-      <thead>
-        <tr>
-          <th>Similarity</th>
-          <th>Label</th>
-          <th>File A</th>
-          <th>File B</th>
-        </tr>
-      </thead>
-      <tbody>
-        {pairs.map(p => (
-          <tr key={p.id}>
-            <td>{(p.similarity*100).toFixed(2)}%</td>
-            <td>{p.label}</td>
-            <td>
-              <div style={{ display: "flex", flexDirection: "column", gap: 4 }}>
-                <span title={`${p.size_a} bytes, ${p.duration_a}s, ${p.res_a}`}>{p.file_a}</span>
-                <button onClick={()=>loadPreview(p.file_a)} disabled={loading[p.file_a]}>Preview</button>
-                <div style={{ display:"flex", gap: 4 }}>
-                  {(previews[p.file_a] || []).map((b64, i) => (
-                    <img key={i} src={`data:image/jpeg;base64,${b64}`} style={{ height: 64 }} />
-                  ))}
-                </div>
-              </div>
-            </td>
-            <td>
-              <div style={{ display: "flex", flexDirection: "column", gap: 4 }}>
-                <span title={`${p.size_b} bytes, ${p.duration_b}s, ${p.res_b}`}>{p.file_b}</span>
-                <button onClick={()=>loadPreview(p.file_b)} disabled={loading[p.file_b]}>Preview</button>
-                <div style={{ display:"flex", gap: 4 }}>
-                  {(previews[p.file_b] || []).map((b64, i) => (
-                    <img key={i} src={`data:image/jpeg;base64,${b64}`} style={{ height: 64 }} />
-                  ))}
-                </div>
-              </div>
-            </td>
+    <>
+      <table style={{ width: "100%", borderCollapse: "collapse" }}>
+        <thead>
+          <tr>
+            <th style={{ textAlign: "left" }}>Similarity</th>
+            <th style={{ textAlign: "left" }}>Label</th>
+            <th style={{ textAlign: "left" }}>File A</th>
+            <th style={{ textAlign: "left" }}>File B</th>
           </tr>
-        ))}
-      </tbody>
-    </table>
+        </thead>
+        <tbody>
+          {pairs.map(p => (
+            <tr key={p.id}>
+              <td>{(p.similarity*100).toFixed(2)}%</td>
+              <td>{p.label}</td>
+              <td>{row(p.file_a, p.size_a, p.duration_a, p.res_a)}</td>
+              <td>{row(p.file_b, p.size_b, p.duration_b, p.res_b)}</td>
+            </tr>
+          ))}
+        </tbody>
+      </table>
+
+      <PreviewModal path={previewPath} onClose={()=>setPreviewPath(null)} />
+    </>
   );
 }

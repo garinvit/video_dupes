@@ -1,12 +1,14 @@
+import type { JobOut, PairOut, GroupOut, Defaults } from "./types";
+
 const API = "/api";
 
-export async function getDefaults() {
+export async function getDefaults(): Promise<Defaults> {
   const r = await fetch(`${API}/jobs/defaults`);
   if (!r.ok) throw new Error("defaults failed");
   return r.json();
 }
 
-export async function listJobs() {
+export async function listJobs(): Promise<JobOut[]> {
   const r = await fetch(`${API}/jobs`);
   if (!r.ok) throw new Error("jobs failed");
   return r.json();
@@ -18,7 +20,7 @@ export async function startJob(payload: {
   scale: number;
   threshold: number;
   exts?: string[];
-}) {
+}): Promise<JobOut> {
   const r = await fetch(`${API}/jobs`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
@@ -28,21 +30,31 @@ export async function startJob(payload: {
   return r.json();
 }
 
-export async function getPairs(jobId: number) {
-  const r = await fetch(`${API}/jobs/${jobId}/pairs`);
+export async function getPairs(jobId: number, limit = 100, offset = 0): Promise<{ data: PairOut[]; total: number; }> {
+  const url = new URL(`${API}/jobs/${jobId}/pairs`, window.location.origin);
+  url.searchParams.set("limit", String(limit));
+  url.searchParams.set("offset", String(offset));
+  const r = await fetch(url.toString().replace(window.location.origin, ""));
   if (!r.ok) throw new Error("pairs failed");
-  return r.json();
+  const total = Number(r.headers.get("X-Total-Count") || "0");
+  const data = await r.json() as PairOut[];
+  return { data, total };
 }
 
-export async function getGroups(jobId: number) {
-  const r = await fetch(`${API}/jobs/${jobId}/groups`);
+export async function getGroups(jobId: number, limit = 100, offset = 0): Promise<{ data: GroupOut[]; total: number; }> {
+  const url = new URL(`${API}/jobs/${jobId}/groups`, window.location.origin);
+  url.searchParams.set("limit", String(limit));
+  url.searchParams.set("offset", String(offset));
+  const r = await fetch(url.toString().replace(window.location.origin, ""));
   if (!r.ok) throw new Error("groups failed");
-  return r.json();
+  const total = Number(r.headers.get("X-Total-Count") || "0");
+  const data = await r.json() as GroupOut[];
+  return { data, total };
 }
 
-export async function getFramesBase64(path: string, count = 3, scale = 320) {
+export async function getFramesBase64(path: string, count = 3, scale = 320): Promise<{ frames: string[] }> {
   const url = new URL(`${API}/files/frames`, window.location.origin);
-  url.pathname = `${API}/files/frames`; // ensure proxy
+  url.pathname = `${API}/files/frames`;
   url.searchParams.set("path", path);
   url.searchParams.set("count", String(count));
   url.searchParams.set("scale", String(scale));
@@ -51,7 +63,7 @@ export async function getFramesBase64(path: string, count = 3, scale = 320) {
   return r.json() as Promise<{ frames: string[] }>;
 }
 
-export async function deletePaths(paths: string[]) {
+export async function deletePaths(paths: string[]): Promise<{ bytes: number }> {
   const r = await fetch(`${API}/files/delete`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
@@ -61,7 +73,7 @@ export async function deletePaths(paths: string[]) {
   return r.json() as Promise<{ bytes: number }>;
 }
 
-export async function deleteGroup(groupId: number, paths?: string[]) {
+export async function deleteGroup(groupId: number, paths?: string[]): Promise<{ bytes: number }> {
   const r = await fetch(`${API}/files/groups/${groupId}/delete`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },

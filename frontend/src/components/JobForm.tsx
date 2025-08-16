@@ -2,9 +2,7 @@ import React, { useEffect, useState } from "react";
 import { getDefaults, startJob } from "../api";
 import type { Defaults, JobOut } from "../types";
 
-type Props = {
-  onJobStarted(job: JobOut): void;
-};
+type Props = { onJobStarted(job: JobOut): void; };
 
 export default function JobForm({ onJobStarted }: Props) {
   const [d, setD] = useState<Defaults | null>(null);
